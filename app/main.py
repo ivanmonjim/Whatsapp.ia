@@ -44,17 +44,14 @@ class NumeroWhatsAppEntrada(BaseModel):
 class WebhookMeta(BaseModel):
     data: dict
 
-def limpiar_flujos_activos(
-    db: Session,
-    empresa_id: int,
-    telefono_cliente: str
-):
+
+def limpiar_flujos_activos(db: Session, empresa_id: int, telefono_cliente: str):
     flujos = (
         db.query(Conversacion)
         .filter(
             Conversacion.empresa_id == empresa_id,
             Conversacion.telefono == telefono_cliente,
-            Conversacion.paso != None
+            Conversacion.paso != None,
         )
         .all()
     )
@@ -63,6 +60,7 @@ def limpiar_flujos_activos(
         flujo.paso = None
 
     db.commit()
+
 
 def normalizar_telefono(telefono: str):
     telefono = telefono.strip()
@@ -92,6 +90,21 @@ def get_db():
 @app.get("/")
 def inicio():
     return {"status": "ok", "mensaje": "WhatsApp IA funcionando"}
+
+
+@app.get("/webhook-whatsapp")
+def verificar_webhook(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+):
+    print("META VERIFY TOKEN:", META_VERIFY_TOKEN)
+    print("TOKEN RECIBIDO:", hub_verify_token)
+
+    if hub_mode == "subscribe" and hub_verify_token == META_VERIFY_TOKEN:
+        return int(hub_challenge)
+
+    raise HTTPException(status_code=403, detail="Token inválido")
 
 
 @app.post("/empresas")
@@ -528,15 +541,17 @@ def obtener_flujo_activo(db: Session, empresa_id: int, telefono_cliente: str):
         .filter(
             Conversacion.empresa_id == empresa_id,
             Conversacion.telefono == telefono_cliente,
-            Conversacion.paso.in_([
-                "PEDIR_SERVICIO",
-                "PEDIR_NOMBRE",
-                "PEDIR_FECHA",
-                "PEDIR_HORA",
-                "CONFIRMAR_CANCELACION",
-                "REPROGRAMAR_FECHA",
-                "REPROGRAMAR_HORA",
-            ]),
+            Conversacion.paso.in_(
+                [
+                    "PEDIR_SERVICIO",
+                    "PEDIR_NOMBRE",
+                    "PEDIR_FECHA",
+                    "PEDIR_HORA",
+                    "CONFIRMAR_CANCELACION",
+                    "REPROGRAMAR_FECHA",
+                    "REPROGRAMAR_HORA",
+                ]
+            ),
         )
         .order_by(Conversacion.id.desc())
         .first()
@@ -587,51 +602,60 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
     )
     print("FLUJO ACTUAL:", flujo.paso if flujo else None)
 
-    if mensaje_lower in ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches"]:
-
+    if mensaje_lower in [
+        "hola",
+        "buenas",
+        "buenos dias",
+        "buenas tardes",
+        "buenas noches",
+    ]:
         cita_activa = (
-        db.query(Cita)
-        .filter(
-            Cita.empresa_id == empresa.id,
-            Cita.telefono == telefono_cliente,
-            Cita.status.in_(["AGENDADA", "CONFIRMADA"])
+            db.query(Cita)
+            .filter(
+                Cita.empresa_id == empresa.id,
+                Cita.telefono == telefono_cliente,
+                Cita.status.in_(["AGENDADA", "CONFIRMADA"]),
+            )
+            .first()
         )
-        .first()
-    )
 
         if cita_activa:
             respuesta = (
-            "¡Hola! 👋\n\n"
-            "Encontramos una cita agendada.\n\n"
-            f"📅 Fecha: {cita_activa.fecha}\n"
-            f"🕒 Hora: {cita_activa.hora}\n\n"
-            "Si deseas cancelarla escribe:\n"
-            "👉 Cancelar cita\n\n"
-            "Si deseas reprogramarla escribe:\n"
-            "👉 Reprogramar cita"
-        )
+                "¡Hola! 👋\n\n"
+                "Encontramos una cita agendada.\n\n"
+                f"📅 Fecha: {cita_activa.fecha}\n"
+                f"🕒 Hora: {cita_activa.hora}\n\n"
+                "Si deseas cancelarla escribe:\n"
+                "👉 Cancelar cita\n\n"
+                "Si deseas reprogramarla escribe:\n"
+                "👉 Reprogramar cita"
+            )
         else:
             respuesta = (
-            "¡Hola! 👋\n\n"
-            "¿En qué puedo ayudarte hoy?\n\n"
-            "Si deseas agendar una cita escribe:\n"
-            "👉 Quiero agendar una cita"
-        )
+                "¡Hola! 👋\n\n"
+                "¿En qué puedo ayudarte hoy?\n\n"
+                "Si deseas agendar una cita escribe:\n"
+                "👉 Quiero agendar una cita"
+            )
 
         enviar_mensaje_whatsapp(
-        phone_number_id=numero.phone_number_id,
-        token=numero.token,
-        telefono_cliente=telefono_cliente,
-        mensaje=respuesta,
-    )
+            phone_number_id=numero.phone_number_id,
+            token=numero.token,
+            telefono_cliente=telefono_cliente,
+            mensaje=respuesta,
+        )
 
         return {"status": "saludo"}
 
     if (
-    "cancelar" in mensaje_lower
-    and "cita" in mensaje_lower
-    and (not flujo or flujo.paso in ["PEDIR_SERVICIO", "PEDIR_NOMBRE", "PEDIR_FECHA", "PEDIR_HORA"])
-):
+        "cancelar" in mensaje_lower
+        and "cita" in mensaje_lower
+        and (
+            not flujo
+            or flujo.paso
+            in ["PEDIR_SERVICIO", "PEDIR_NOMBRE", "PEDIR_FECHA", "PEDIR_HORA"]
+        )
+    ):
         print("ENTRO A CANCELAR CITA")
 
         cita_activa = (
@@ -639,7 +663,7 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
             .filter(
                 Cita.empresa_id == empresa.id,
                 Cita.telefono == telefono_cliente,
-                Cita.status.in_(["AGENDADA", "CONFIRMADA"])
+                Cita.status.in_(["AGENDADA", "CONFIRMADA"]),
             )
             .first()
         )
@@ -651,7 +675,7 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
                 phone_number_id=numero.phone_number_id,
                 token=numero.token,
                 telefono_cliente=telefono_cliente,
-                mensaje=respuesta
+                mensaje=respuesta,
             )
 
             return {"status": "sin_cita_activa"}
@@ -677,8 +701,8 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
         )
 
         db.query(Conversacion).filter(
-           Conversacion.empresa_id == empresa.id,
-           Conversacion.telefono == telefono_cliente
+            Conversacion.empresa_id == empresa.id,
+            Conversacion.telefono == telefono_cliente,
         ).delete()
 
         db.commit()
@@ -692,7 +716,7 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
             servicio_id=cita_activa.servicio_id,
             nombre=cita_activa.nombre,
             fecha=cita_activa.fecha,
-            hora=cita_activa.hora
+            hora=cita_activa.hora,
         )
 
         db.add(conversacion)
@@ -702,16 +726,20 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
             phone_number_id=numero.phone_number_id,
             token=numero.token,
             telefono_cliente=telefono_cliente,
-            mensaje=respuesta
+            mensaje=respuesta,
         )
 
         return {"status": "confirmar_cancelacion"}
-    
+
     if (
-    "reprogramar" in mensaje_lower
-    and "cita" in mensaje_lower
-    and (not flujo or flujo.paso in ["PEDIR_SERVICIO", "PEDIR_NOMBRE", "PEDIR_FECHA", "PEDIR_HORA"])
-):
+        "reprogramar" in mensaje_lower
+        and "cita" in mensaje_lower
+        and (
+            not flujo
+            or flujo.paso
+            in ["PEDIR_SERVICIO", "PEDIR_NOMBRE", "PEDIR_FECHA", "PEDIR_HORA"]
+        )
+    ):
         print("ENTRO A REPROGRAMAR CITA")
 
         cita_activa = (
@@ -755,8 +783,8 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
             "¿Para qué nueva fecha deseas reprogramarla?"
         )
         db.query(Conversacion).filter(
-          Conversacion.empresa_id == empresa.id,
-          Conversacion.telefono == telefono_cliente
+            Conversacion.empresa_id == empresa.id,
+            Conversacion.telefono == telefono_cliente,
         ).delete()
 
         db.commit()
@@ -1013,18 +1041,22 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
             "paso": "CITA_CONFIRMADA",
             "cita_id": cita.id,
         }
-        
 
     if flujo and flujo.paso == "CONFIRMAR_CANCELACION":
-
-        if mensaje_lower in ["si", "sí", "si cancelar", "sí cancelar", "confirmo", "confirmar"]:
-
+        if mensaje_lower in [
+            "si",
+            "sí",
+            "si cancelar",
+            "sí cancelar",
+            "confirmo",
+            "confirmar",
+        ]:
             cita_activa = (
                 db.query(Cita)
                 .filter(
                     Cita.empresa_id == empresa.id,
                     Cita.telefono == telefono_cliente,
-                    Cita.status.in_(["AGENDADA", "CONFIRMADA"])
+                    Cita.status.in_(["AGENDADA", "CONFIRMADA"]),
                 )
                 .first()
             )
@@ -1048,13 +1080,12 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
                 phone_number_id=numero.phone_number_id,
                 token=numero.token,
                 telefono_cliente=telefono_cliente,
-                mensaje=respuesta
+                mensaje=respuesta,
             )
 
             return {"status": "cita_cancelada"}
 
         if mensaje_lower in ["no", "no cancelar"]:
-
             respuesta = "Perfecto, tu cita sigue activa."
 
             db.delete(flujo)
@@ -1064,7 +1095,7 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
                 phone_number_id=numero.phone_number_id,
                 token=numero.token,
                 telefono_cliente=telefono_cliente,
-                mensaje=respuesta
+                mensaje=respuesta,
             )
 
             return {"status": "cancelacion_rechazada"}
@@ -1115,7 +1146,6 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
         )
 
         return {"status": "ok", "paso": "PEDIR_SERVICIO"}
-
 
     if flujo and flujo.paso == "REPROGRAMAR_FECHA":
         print("ENTRO A REPROGRAMAR_FECHA")
@@ -1189,7 +1219,9 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
                     .first()
                 )
 
-            nombre_servicio = servicio.nombre if servicio else "Servicio no especificado"
+            nombre_servicio = (
+                servicio.nombre if servicio else "Servicio no especificado"
+            )
 
             respuesta = (
                 "✅ Cita reprogramada correctamente\n\n"
