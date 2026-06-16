@@ -44,6 +44,25 @@ class NumeroWhatsAppEntrada(BaseModel):
 class WebhookMeta(BaseModel):
     data: dict
 
+def limpiar_flujos_activos(
+    db: Session,
+    empresa_id: int,
+    telefono_cliente: str
+):
+    flujos = (
+        db.query(Conversacion)
+        .filter(
+            Conversacion.empresa_id == empresa_id,
+            Conversacion.telefono == telefono_cliente,
+            Conversacion.paso != None
+        )
+        .all()
+    )
+
+    for flujo in flujos:
+        flujo.paso = None
+
+    db.commit()
 
 def normalizar_telefono(telefono: str):
     telefono = telefono.strip()
@@ -509,7 +528,15 @@ def obtener_flujo_activo(db: Session, empresa_id: int, telefono_cliente: str):
         .filter(
             Conversacion.empresa_id == empresa_id,
             Conversacion.telefono == telefono_cliente,
-            Conversacion.paso != None,
+            Conversacion.paso.in_([
+                "PEDIR_SERVICIO",
+                "PEDIR_NOMBRE",
+                "PEDIR_FECHA",
+                "PEDIR_HORA",
+                "CONFIRMAR_CANCELACION",
+                "REPROGRAMAR_FECHA",
+                "REPROGRAMAR_HORA",
+            ]),
         )
         .order_by(Conversacion.id.desc())
         .first()
@@ -558,6 +585,205 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
     flujo = obtener_flujo_activo(
         db=db, empresa_id=empresa.id, telefono_cliente=telefono_cliente
     )
+    print("FLUJO ACTUAL:", flujo.paso if flujo else None)
+
+    if mensaje_lower in ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches"]:
+
+        cita_activa = (
+        db.query(Cita)
+        .filter(
+            Cita.empresa_id == empresa.id,
+            Cita.telefono == telefono_cliente,
+            Cita.status.in_(["AGENDADA", "CONFIRMADA"])
+        )
+        .first()
+    )
+
+        if cita_activa:
+            respuesta = (
+            "¡Hola! 👋\n\n"
+            "Encontramos una cita agendada.\n\n"
+            f"📅 Fecha: {cita_activa.fecha}\n"
+            f"🕒 Hora: {cita_activa.hora}\n\n"
+            "Si deseas cancelarla escribe:\n"
+            "👉 Cancelar cita\n\n"
+            "Si deseas reprogramarla escribe:\n"
+            "👉 Reprogramar cita"
+        )
+        else:
+            respuesta = (
+            "¡Hola! 👋\n\n"
+            "¿En qué puedo ayudarte hoy?\n\n"
+            "Si deseas agendar una cita escribe:\n"
+            "👉 Quiero agendar una cita"
+        )
+
+        enviar_mensaje_whatsapp(
+        phone_number_id=numero.phone_number_id,
+        token=numero.token,
+        telefono_cliente=telefono_cliente,
+        mensaje=respuesta,
+    )
+
+        return {"status": "saludo"}
+
+    if (
+    "cancelar" in mensaje_lower
+    and "cita" in mensaje_lower
+    and (not flujo or flujo.paso in ["PEDIR_SERVICIO", "PEDIR_NOMBRE", "PEDIR_FECHA", "PEDIR_HORA"])
+):
+        print("ENTRO A CANCELAR CITA")
+
+        cita_activa = (
+            db.query(Cita)
+            .filter(
+                Cita.empresa_id == empresa.id,
+                Cita.telefono == telefono_cliente,
+                Cita.status.in_(["AGENDADA", "CONFIRMADA"])
+            )
+            .first()
+        )
+
+        if not cita_activa:
+            respuesta = "No encontré ninguna cita activa para cancelar."
+
+            enviar_mensaje_whatsapp(
+                phone_number_id=numero.phone_number_id,
+                token=numero.token,
+                telefono_cliente=telefono_cliente,
+                mensaje=respuesta
+            )
+
+            return {"status": "sin_cita_activa"}
+
+        servicio = None
+
+        if cita_activa.servicio_id:
+            servicio = (
+                db.query(Servicio)
+                .filter(Servicio.id == cita_activa.servicio_id)
+                .first()
+            )
+
+        nombre_servicio = servicio.nombre if servicio else "Servicio no especificado"
+
+        respuesta = (
+            "Encontré tu cita:\n\n"
+            f"Servicio: {nombre_servicio}\n"
+            f"Fecha: {cita_activa.fecha}\n"
+            f"Hora: {cita_activa.hora}\n\n"
+            "¿Deseas cancelarla?\n"
+            "Responde: Sí cancelar o No"
+        )
+
+        db.query(Conversacion).filter(
+           Conversacion.empresa_id == empresa.id,
+           Conversacion.telefono == telefono_cliente
+        ).delete()
+
+        db.commit()
+
+        conversacion = Conversacion(
+            empresa_id=empresa.id,
+            telefono=telefono_cliente,
+            mensaje=mensaje,
+            respuesta=respuesta,
+            paso="CONFIRMAR_CANCELACION",
+            servicio_id=cita_activa.servicio_id,
+            nombre=cita_activa.nombre,
+            fecha=cita_activa.fecha,
+            hora=cita_activa.hora
+        )
+
+        db.add(conversacion)
+        db.commit()
+
+        enviar_mensaje_whatsapp(
+            phone_number_id=numero.phone_number_id,
+            token=numero.token,
+            telefono_cliente=telefono_cliente,
+            mensaje=respuesta
+        )
+
+        return {"status": "confirmar_cancelacion"}
+    
+    if (
+    "reprogramar" in mensaje_lower
+    and "cita" in mensaje_lower
+    and (not flujo or flujo.paso in ["PEDIR_SERVICIO", "PEDIR_NOMBRE", "PEDIR_FECHA", "PEDIR_HORA"])
+):
+        print("ENTRO A REPROGRAMAR CITA")
+
+        cita_activa = (
+            db.query(Cita)
+            .filter(
+                Cita.empresa_id == empresa.id,
+                Cita.telefono == telefono_cliente,
+                Cita.status.in_(["AGENDADA", "CONFIRMADA"]),
+            )
+            .first()
+        )
+
+        if not cita_activa:
+            respuesta = "No encontré ninguna cita activa para reprogramar."
+
+            enviar_mensaje_whatsapp(
+                phone_number_id=numero.phone_number_id,
+                token=numero.token,
+                telefono_cliente=telefono_cliente,
+                mensaje=respuesta,
+            )
+
+            return {"status": "sin_cita_activa"}
+
+        servicio = None
+
+        if cita_activa.servicio_id:
+            servicio = (
+                db.query(Servicio)
+                .filter(Servicio.id == cita_activa.servicio_id)
+                .first()
+            )
+
+        nombre_servicio = servicio.nombre if servicio else "Servicio no especificado"
+
+        respuesta = (
+            "Encontré tu cita actual:\n\n"
+            f"Servicio: {nombre_servicio}\n"
+            f"Fecha: {cita_activa.fecha}\n"
+            f"Hora: {cita_activa.hora}\n\n"
+            "¿Para qué nueva fecha deseas reprogramarla?"
+        )
+        db.query(Conversacion).filter(
+          Conversacion.empresa_id == empresa.id,
+          Conversacion.telefono == telefono_cliente
+        ).delete()
+
+        db.commit()
+
+        conversacion = Conversacion(
+            empresa_id=empresa.id,
+            telefono=telefono_cliente,
+            mensaje=mensaje,
+            respuesta=respuesta,
+            paso="REPROGRAMAR_FECHA",
+            servicio_id=cita_activa.servicio_id,
+            nombre=cita_activa.nombre,
+            fecha=cita_activa.fecha,
+            hora=cita_activa.hora,
+        )
+
+        db.add(conversacion)
+        db.commit()
+
+        enviar_mensaje_whatsapp(
+            phone_number_id=numero.phone_number_id,
+            token=numero.token,
+            telefono_cliente=telefono_cliente,
+            mensaje=respuesta,
+        )
+
+        return {"status": "reprogramar_fecha"}
 
     if flujo and flujo.paso == "PEDIR_SERVICIO":
         servicios = (
@@ -621,7 +847,14 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
         flujo.paso = "PEDIR_FECHA"
         db.commit()
 
-        respuesta = f"Perfecto, {flujo.nombre}. ¿Qué fecha deseas para tu cita?"
+        respuesta = (
+            f"Perfecto, {flujo.nombre}.\n\n"
+            "¿Qué fecha deseas para tu cita?\n\n"
+            "📅 Utiliza el formato:\n"
+            "DD/MM/YYYY\n\n"
+            "Ejemplo:\n"
+            "18/06/2026"
+        )
 
         conversacion = Conversacion(
             empresa_id=empresa.id,
@@ -651,7 +884,12 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
         db.commit()
 
         respuesta = (
-            f"Perfecto. Registré la fecha {flujo.fecha}. ¿A qué hora deseas tu cita?"
+            f"Perfecto. Registré la fecha {flujo.fecha}.\n\n"
+            "🕒 ¿A qué hora deseas tu cita?\n\n"
+            "Utiliza formato 24 horas:\n"
+            "HH:MM\n\n"
+            "Ejemplo:\n"
+            "15:00"
         )
 
         conversacion = Conversacion(
@@ -741,7 +979,11 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
             f"Nombre: {nombre_cliente}\n"
             f"Fecha: {fecha_cita}\n"
             f"Hora: {hora_cita}\n\n"
-            "Gracias por agendar con nosotros."
+            "Gracias por agendar con nosotros.\n\n"
+            "Si deseas cancelar tu cita escribe:\n"
+            "👉 Cancelar cita\n\n"
+            "Si deseas reprogramarla escribe:\n"
+            "👉 Reprogramar cita"
         )
 
         conversacion = Conversacion(
@@ -771,75 +1013,7 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
             "paso": "CITA_CONFIRMADA",
             "cita_id": cita.id,
         }
-
-    if "cancelar" in mensaje_lower and "cita" in mensaje_lower and not flujo:
-        print("ENTRO A CANCELAR CITA")
-
-        cita_activa = (
-            db.query(Cita)
-            .filter(
-                Cita.empresa_id == empresa.id,
-                Cita.telefono == telefono_cliente,
-                Cita.status.in_(["AGENDADA", "CONFIRMADA"])
-            )
-            .first()
-        )
-
-        if not cita_activa:
-            respuesta = "No encontré ninguna cita activa para cancelar."
-
-            enviar_mensaje_whatsapp(
-                phone_number_id=numero.phone_number_id,
-                token=numero.token,
-                telefono_cliente=telefono_cliente,
-                mensaje=respuesta
-            )
-
-            return {"status": "sin_cita_activa"}
-
-        servicio = None
-
-        if cita_activa.servicio_id:
-            servicio = (
-                db.query(Servicio)
-                .filter(Servicio.id == cita_activa.servicio_id)
-                .first()
-            )
-
-        nombre_servicio = servicio.nombre if servicio else "Servicio no especificado"
-
-        respuesta = (
-            "Encontré tu cita:\n\n"
-            f"Servicio: {nombre_servicio}\n"
-            f"Fecha: {cita_activa.fecha}\n"
-            f"Hora: {cita_activa.hora}\n\n"
-            "¿Deseas cancelarla?\n"
-            "Responde: Sí cancelar o No"
-        )
-
-        conversacion = Conversacion(
-            empresa_id=empresa.id,
-            telefono=telefono_cliente,
-            mensaje=mensaje,
-            respuesta=respuesta,
-            paso="CONFIRMAR_CANCELACION",
-            servicio_id=cita_activa.servicio_id,
-            nombre=cita_activa.nombre,
-            fecha=cita_activa.fecha,
-            hora=cita_activa.hora
-        )
-
-        db.add(conversacion)
-        db.commit()
-
-        enviar_mensaje_whatsapp(
-            phone_number_id=numero.phone_number_id,
-            token=numero.token,
-            telefono_cliente=telefono_cliente,
-            mensaje=respuesta
-        )
-
-        return {"status": "confirmar_cancelacion"}
+        
 
     if flujo and flujo.paso == "CONFIRMAR_CANCELACION":
 
@@ -857,6 +1031,7 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
 
             if cita_activa:
                 cita_activa.status = "CANCELADA"
+                db.commit()
 
                 respuesta = (
                     "✅ Cita cancelada correctamente\n\n"
@@ -941,48 +1116,21 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
 
         return {"status": "ok", "paso": "PEDIR_SERVICIO"}
 
-    if "reprogramar" in mensaje_lower and "cita" in mensaje_lower and not flujo:
-        print("ENTRO A REPROGRAMAR CITA")
 
-        cita_activa = (
-            db.query(Cita)
-            .filter(
-                Cita.empresa_id == empresa.id,
-                Cita.telefono == telefono_cliente,
-                Cita.status.in_(["AGENDADA", "CONFIRMADA"]),
-            )
-            .first()
-        )
+    if flujo and flujo.paso == "REPROGRAMAR_FECHA":
+        print("ENTRO A REPROGRAMAR_FECHA")
 
-        if not cita_activa:
-            respuesta = "No encontré ninguna cita activa para reprogramar."
-
-            enviar_mensaje_whatsapp(
-                phone_number_id=numero.phone_number_id,
-                token=numero.token,
-                telefono_cliente=telefono_cliente,
-                mensaje=respuesta,
-            )
-
-            return {"status": "sin_cita_activa"}
-
-        servicio = None
-
-        if cita_activa.servicio_id:
-            servicio = (
-                db.query(Servicio)
-                .filter(Servicio.id == cita_activa.servicio_id)
-                .first()
-            )
-
-        nombre_servicio = servicio.nombre if servicio else "Servicio no especificado"
+        flujo.fecha = mensaje.strip()
+        flujo.paso = "REPROGRAMAR_HORA"
+        db.commit()
 
         respuesta = (
-            "Encontré tu cita actual:\n\n"
-            f"Servicio: {nombre_servicio}\n"
-            f"Fecha: {cita_activa.fecha}\n"
-            f"Hora: {cita_activa.hora}\n\n"
-            "¿Para qué nueva fecha deseas reprogramarla?"
+            f"Perfecto. Nueva fecha: {flujo.fecha}.\n\n"
+            "🕒 ¿A qué hora deseas reprogramarla?\n\n"
+            "Utiliza formato 24 horas:\n"
+            "HH:MM\n\n"
+            "Ejemplo:\n"
+            "15:00"
         )
 
         conversacion = Conversacion(
@@ -990,11 +1138,11 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
             telefono=telefono_cliente,
             mensaje=mensaje,
             respuesta=respuesta,
-            paso="REPROGRAMAR_FECHA",
-            servicio_id=cita_activa.servicio_id,
-            nombre=cita_activa.nombre,
-            fecha=cita_activa.fecha,
-            hora=cita_activa.hora,
+            paso="REPROGRAMAR_HORA",
+            servicio_id=flujo.servicio_id,
+            nombre=flujo.nombre,
+            fecha=flujo.fecha,
+            hora=flujo.hora,
         )
 
         db.add(conversacion)
@@ -1007,28 +1155,11 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
             mensaje=respuesta,
         )
 
-        return {"status": "reprogramar_fecha"}
-
-    if flujo and flujo.paso == "REPROGRAMAR_FECHA":
-        flujo.fecha = mensaje.strip()
-        flujo.paso = "REPROGRAMAR_HORA"
-        db.commit()
-
-        respuesta = (
-            f"Perfecto. Nueva fecha: {flujo.fecha}.\n"
-            "¿A qué hora deseas reprogramarla?"
-        )
-
-        enviar_mensaje_whatsapp(
-            phone_number_id=numero.phone_number_id,
-            token=numero.token,
-            telefono_cliente=telefono_cliente,
-            mensaje=respuesta,
-        )
-
         return {"status": "reprogramar_hora"}
-    
+
     if flujo and flujo.paso == "REPROGRAMAR_HORA":
+        print("ENTRO A REPROGRAMAR_HORA")
+
         nueva_hora = mensaje.strip()
 
         cita_activa = (
@@ -1065,7 +1196,11 @@ async def recibir_webhook_whatsapp(data: dict, db: Session = Depends(get_db)):
                 f"Servicio: {nombre_servicio}\n"
                 f"Nombre: {cita_activa.nombre}\n"
                 f"Fecha: {cita_activa.fecha}\n"
-                f"Hora: {cita_activa.hora}"
+                f"Hora: {cita_activa.hora}\n\n"
+                "Si deseas cancelar tu cita escribe:\n"
+                "👉 Cancelar cita\n\n"
+                "Si deseas volver a cambiarla escribe:\n"
+                "👉 Reprogramar cita"
             )
 
         db.delete(flujo)
@@ -1126,6 +1261,7 @@ Historial de conversación:
 Última respuesta del asistente:
 {respuesta}
 """
+    cita_existente = None
 
     try:
         datos_cita = detectar_datos_cita(texto_para_cita)
